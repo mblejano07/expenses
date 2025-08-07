@@ -1,6 +1,12 @@
 import json
+import boto3
+import base64
+import uuid
+from datetime import datetime
+from multipart import MultipartParser
+from io import BytesIO
 
-FAKE_DB = {} #for testing purposes only
+FAKE_DB = {}  # for testing purposes only
 ROUTES = {}
 
 def route(path, method):
@@ -9,21 +15,56 @@ def route(path, method):
         return func
     return decorator
 
-# @route("/hello", "GET")
-# def hello_handler(event):
-#     return {"statusCode": 200, "body": "Hello!"}
+s3 = boto3.client("s3")
+BUCKET_NAME = "your-bucket-name"  # Replace this when ready
 
-# @route("/goodbye", "GET")
-# def goodbye_handler(event):
-#     return {"statusCode": 200, "body": "Goodbye!"}
+def parse_multipart(event):
+    content_type = event["headers"].get("Content-Type") or event["headers"].get("content-type")
+    body_bytes = base64.b64decode(event["body"])
+    parser = MultipartParser(BytesIO(body_bytes), content_type)
+
+    result = {}
+    file_data = None
+
+    for part in parser.parts():
+        if part.filename:
+            file_data = {
+                "filename": part.filename,
+                "content": part.file,
+            }
+        else:
+            result[part.name] = part.text
+
+    return result, file_data
 
 @route("/invoices", "POST")
 def create_invoice_handler(event):
     try:
-        body = json.loads(event.get("body", "{}"))
+        content_type = event["headers"].get("Content-Type") or event["headers"].get("content-type")
 
-        # Basic validation (feel free to expand as needed)
-        required_fields = ["reference_id","company_name", "tin", "invoice_number", "transaction_date", "items"]
+        if content_type.startswith("multipart/form-data"):
+            body, file_data = parse_multipart(event)
+
+            if file_data:
+                file_key = f"invoices/{uuid.uuid4()}_{file_data['filename']}"
+                s3.upload_fileobj(file_data["content"], BUCKET_NAME, file_key)
+                body["file_url"] = f"https://{BUCKET_NAME}.s3.amazonaws.com/{file_key}"
+            else:
+                body["file_url"] = "no-file-uploaded"
+
+        elif content_type.startswith("application/json"):
+            body = json.loads(event.get("body", "{}"))
+            body["file_url"] = "no-file-uploaded"
+        else:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "Unsupported Content-Type"})
+            }
+
+        required_fields = [
+            "reference_id", "company_name", "tin", "invoice_number", "transaction_date",
+            "items", "encoder", "payee", "payee_account", "approver"
+        ]
         for field in required_fields:
             if field not in body:
                 return {
@@ -31,50 +72,54 @@ def create_invoice_handler(event):
                     "body": json.dumps({"error": f"Missing field: {field}"})
                 }
 
-        # Process items
-        items = body["items"]
+        items = json.loads(body["items"]) if isinstance(body["items"], str) else body["items"]
         for item in items:
-            item_fields = ["id", "particulars", "project_class", "account", "vatable", "amount"]
-            for f in item_fields:
+            for f in ["id", "particulars", "project_class", "account", "vatable", "amount"]:
                 if f not in item:
                     return {
                         "statusCode": 400,
                         "body": json.dumps({"error": f"Missing item field: {f}"})
                     }
-                
-        # Store in fake DB using invoice_number as the key
-        reference_id = body["reference_id"]
 
+        reference_id = body["reference_id"]
         if reference_id in FAKE_DB:
             return {
                 "statusCode": 409,
                 "body": json.dumps({"error": "Invoice already exists"})
             }
 
-        FAKE_DB[reference_id] = body
-
-        # For now, just return the received data as confirmation
-        return {
-            "statusCode": 201,
-            "body": json.dumps({
-                "message": "Invoice received",
-                "data": body
-            })
+        invoice_data = {
+            "reference_id": reference_id,
+            "company_name": body["company_name"],
+            "tin": body["tin"],
+            "invoice_number": body["invoice_number"],
+            "transaction_date": body["transaction_date"],
+            "items": items,
+            "encoder": body["encoder"],
+            "payee": body["payee"],
+            "payee_account": body["payee_account"],
+            "approver": body["approver"],
+            "file_url": body.get("file_url", "no-file-uploaded"),
+            "encoding_date": datetime.utcnow().isoformat(),
+            "status": "Pending"
         }
 
-    except json.JSONDecodeError:
+        FAKE_DB[reference_id] = invoice_data
+
         return {
-            "statusCode": 400,
-            "body": json.dumps({"error": "Invalid JSON"})
+            "statusCode": 201,
+            "body": json.dumps({"message": "Invoice created", "data": invoice_data})
+        }
+
+    except Exception as e:
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e)})
         }
 
 @route("/invoices", "GET")
 def get_all_invoices(event):
-    # Dummy example list of invoices
-    invoices = [
-        {"reference_id": "082025-001", "amount": 1500},
-        {"reference_id": "082025-002", "amount": 2200},
-    ]
+    invoices = list(FAKE_DB.values())
     return {
         "statusCode": 200,
         "body": json.dumps(invoices),
@@ -84,8 +129,6 @@ def get_all_invoices(event):
 @route("/invoices/{reference_id}", "GET")
 def get_invoice_handler(event):
     reference_id = event["pathParameters"]["reference_id"]
-
-    # Replace with actual database/query logic
     invoice = FAKE_DB.get(reference_id)
 
     if invoice:
@@ -98,20 +141,18 @@ def get_invoice_handler(event):
             "statusCode": 404,
             "body": json.dumps({"error": "Invoice not found"})
         }
-    
+
 @route("/invoices/{reference_id}", "PUT")
 def update_invoice_handler(event):
     reference_id = event["pathParameters"]["reference_id"]
     body = json.loads(event.get("body", "{}"))
 
-    # Check if invoice exists
     if reference_id not in FAKE_DB:
         return {
             "statusCode": 404,
             "body": json.dumps({"error": "Invoice not found"})
         }
 
-    # Validate fields to update
     allowed_fields = ["company_name", "tin", "transaction_date", "items"]
     updated_fields = {key: value for key, value in body.items() if key in allowed_fields}
 
@@ -121,7 +162,6 @@ def update_invoice_handler(event):
             "body": json.dumps({"error": "No valid fields to update"})
         }
 
-    # Example update logic (overwrite fields)
     FAKE_DB[reference_id].update(updated_fields)
 
     return {
@@ -204,7 +244,6 @@ def delete_item_from_invoice(event):
         "body": json.dumps({"message": f"Item {item_id} deleted"})
     }
 
-
 def lambda_handler(event, context):
     path = event.get("path")
     method = event.get("httpMethod")
@@ -219,26 +258,24 @@ def lambda_handler(event, context):
         if route_method != method:
             continue
 
-        # Example: /invoices/{reference_id}
-        if "{" in route_path:
-            route_parts = route_path.strip("/").split("/")
-            path_parts = path.strip("/").split("/")
+        route_parts = route_path.strip("/").split("/")
+        path_parts = path.strip("/").split("/")
 
-            if len(route_parts) != len(path_parts):
-                continue
+        if len(route_parts) != len(path_parts):
+            continue
 
-            path_params = {}
-            matched = True
-            for route_part, path_part in zip(route_parts, path_parts):
-                if route_part.startswith("{") and route_part.endswith("}"):
-                    key = route_part[1:-1]
-                    path_params[key] = path_part
-                elif route_part != path_part:
-                    matched = False
-                    break
+        path_params = {}
+        matched = True
+        for route_part, path_part in zip(route_parts, path_parts):
+            if route_part.startswith("{") and route_part.endswith("}"):
+                key = route_part[1:-1]
+                path_params[key] = path_part
+            elif route_part != path_part:
+                matched = False
+                break
 
-            if matched:
-                event["pathParameters"] = path_params
-                return handler(event)
+        if matched:
+            event["pathParameters"] = path_params
+            return handler(event)
 
     return {"statusCode": 404, "body": "Not Found"}
