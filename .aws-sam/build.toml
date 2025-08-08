@@ -5,7 +5,7 @@ codeuri = "/Users/mblejano/myapp/hello_world"
 runtime = "python3.13"
 architecture = "x86_64"
 handler = "app.lambda_handler"
-manifest_hash = "30ac131ce0c52a22e34f459ace43534a"
+manifest_hash = "619271090d46a90ab1a4eaa1d65d8ac6"
 packagetype = "Zip"
 functions = ["HelloWorldFunction"]
 
